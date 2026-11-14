@@ -2,416 +2,209 @@
 Test Suite for Resume Database API
 ===================================
 
-Run this file to test all database operations.
-"""
+Runs against an isolated test database (see conftest.py) and cleans up after
+itself. Requires a reachable MongoDB at MONGO_URI; skipped otherwise.
 
-from Db import ResumeDatabase
-from pymongo.errors import DuplicateKeyError, PyMongoError
+    pytest test_db.py        # or: python test_db.py
+"""
 import sys
 
+import pytest
+from pymongo.errors import DuplicateKeyError
 
-def test_connection():
-    """Test database connection"""
-    print("\n" + "="*60)
-    print("TEST 1: Database Connection")
-    print("="*60)
-    
-    try:
-        db = ResumeDatabase()
-        print("✓ Successfully connected to MongoDB")
-        db.close_connection()
-        print("✓ Connection closed successfully")
-        return True
-    except Exception as e:
-        print(f"✗ Connection failed: {e}")
-        return False
+import Db
+from Db import ResumeDatabase
 
 
-def test_insert():
-    """Test insert operation"""
-    print("\n" + "="*60)
-    print("TEST 2: Insert Resume")
-    print("="*60)
-    
-    db = ResumeDatabase()
-    
-    test_resume = {
+def make_resume(**overrides):
+    resume = {
         '_id': 'test_resume_001',
         'name': 'Alice Johnson',
         'contact_information': '+1-234-567-8900',
         'email_address': 'alice@example.com',
         'linkedin_profile': 'linkedin.com/in/alice',
         'skills': ['Python', 'MongoDB', 'FastAPI', 'React'],
-        'experience': [
-            {
-                'company': 'Tech Corp',
-                'position': 'Senior Developer',
-                'duration': '2020-2023',
-                'description': 'Led development team'
-            }
-        ],
-        'education': [
-            {
-                'degree': 'BS Computer Science',
-                'university': 'MIT',
-                'year': 2020
-            }
-        ],
-        'projects': [
-            {
-                'name': 'E-commerce Platform',
-                'description': 'Built scalable e-commerce solution',
-                'technologies': ['Python', 'MongoDB', 'React']
-            }
-        ],
-        'extras': ['AWS Certified', 'Published 3 research papers']
+        'experience': [{'company': 'Tech Corp', 'position': 'Senior Developer',
+                        'duration': '2020-2023', 'description': 'Led development team'}],
+        'education': [{'degree': 'BS Computer Science', 'university': 'MIT', 'year': 2020}],
+        'projects': [{'name': 'E-commerce Platform', 'technologies': ['Python', 'MongoDB']}],
+        'extras': ['AWS Certified'],
     }
-    
-    try:
-        # Clean up if exists
-        db.delete_resume('test_resume_001')
-        
-        result = db.insert_resume(test_resume)
-        print(f"✓ Resume inserted: {result['id']}")
-        print(f"  Message: {result['message']}")
-        
-        # Verify insertion
-        retrieved = db.get_resume('test_resume_001')
-        if retrieved and retrieved['name'] == 'Alice Johnson':
-            print("✓ Resume verified in database")
-            return True
-        else:
-            print("✗ Resume not found after insertion")
-            return False
-            
-    except DuplicateKeyError:
-        print("✗ Resume with this ID already exists")
-        return False
-    except Exception as e:
-        print(f"✗ Insert failed: {e}")
-        return False
-    finally:
-        db.close_connection()
+    resume.update(overrides)
+    return resume
 
 
-def test_get():
-    """Test get operation"""
-    print("\n" + "="*60)
-    print("TEST 3: Get Resume")
-    print("="*60)
-    
-    db = ResumeDatabase()
-    
-    try:
-        resume = db.get_resume('test_resume_001')
-        if resume:
-            print(f"✓ Resume retrieved: {resume['name']}")
-            print(f"  Email: {resume.get('email_address', 'N/A')}")
-            print(f"  Skills: {', '.join(resume.get('skills', []))}")
-            return True
-        else:
-            print("✗ Resume not found")
-            return False
-    except Exception as e:
-        print(f"✗ Get failed: {e}")
-        return False
-    finally:
-        db.close_connection()
+RANKING = {
+    'skills': {'score': 38, 'justification': 'Strong Python and MongoDB skills'},
+    'experience': {'score': 32, 'justification': 'Senior developer'},
+    'projects': {'score': 9, 'justification': 'E-commerce platform'},
+    'other_relevant_skills': {'score': 8, 'justification': 'AWS'},
+    'extras': {'score': 5, 'justification': 'Certification'},
+    'total_score': 92,
+}
 
 
-def test_update():
-    """Test update operation"""
-    print("\n" + "="*60)
-    print("TEST 4: Update Resume")
-    print("="*60)
-    
-    db = ResumeDatabase()
-    
-    try:
-        # Add a new skill
-        result = db.update_resume('test_resume_001', {
-            'skills': ['Python', 'MongoDB', 'FastAPI', 'React', 'Docker']
-        })
-        
-        print(f"✓ Update result:")
-        print(f"  Matched: {result['matched_count']}")
-        print(f"  Modified: {result['modified_count']}")
-        
-        # Verify update
-        resume = db.get_resume('test_resume_001')
-        if 'Docker' in resume.get('skills', []):
-            print("✓ Update verified - Docker skill added")
-            return True
-        else:
-            print("✗ Update not reflected")
-            return False
-            
-    except Exception as e:
-        print(f"✗ Update failed: {e}")
-        return False
-    finally:
-        db.close_connection()
+def test_connection(db):
+    assert db.client.admin.command('ping')['ok'] == 1
 
 
-def test_search():
-    """Test search operation"""
-    print("\n" + "="*60)
-    print("TEST 5: Search Resumes")
-    print("="*60)
-    
-    db = ResumeDatabase()
-    
-    try:
-        # Search for Python developers
-        results = db.search_resumes({
-            'skills': {'$in': ['Python']}
-        })
-        
-        print(f"✓ Found {len(results)} Python developer(s)")
-        for resume in results:
-            print(f"  - {resume.get('name', 'Unknown')}")
-        
-        return len(results) > 0
-        
-    except Exception as e:
-        print(f"✗ Search failed: {e}")
-        return False
-    finally:
-        db.close_connection()
+def test_context_manager_closes_connection(db):
+    with ResumeDatabase() as other:
+        assert other.client is not None
+    assert other.client is None
+    other.close_connection()  # idempotent
 
 
-def test_ranking():
-    """Test ranking operation"""
-    print("\n" + "="*60)
-    print("TEST 6: Add Ranking")
-    print("="*60)
-    
-    db = ResumeDatabase()
-    
-    try:
-        ranking_data = {
-            'skills': {
-                'score': 38,
-                'justification': 'Strong Python and MongoDB skills'
-            },
-            'experience': {
-                'score': 32,
-                'justification': 'Senior developer with leadership experience'
-            },
-            'projects': {
-                'score': 9,
-                'justification': 'Impressive e-commerce platform project'
-            },
-            'other_relevant_skills': {
-                'score': 8,
-                'justification': 'Cloud expertise with AWS'
-            },
-            'extras': {
-                'score': 5,
-                'justification': 'AWS certification and publications'
-            },
-            'total_score': 92
-        }
-        
-        job_description = "Looking for Senior Full Stack Developer with Python and MongoDB"
-        
-        result = db.add_ranking('test_resume_001', ranking_data, job_description)
-        
-        if result['success']:
-            print(f"✓ Ranking added: Total Score = {ranking_data['total_score']}/100")
-            
-            # Verify ranking
-            resume = db.get_resume('test_resume_001')
-            if 'rankings' in resume and len(resume['rankings']) > 0:
-                print(f"✓ Ranking verified - {len(resume['rankings'])} ranking(s) in database")
-                return True
-            else:
-                print("✗ Ranking not found in database")
-                return False
-        else:
-            print("✗ Ranking addition failed")
-            return False
-            
-    except Exception as e:
-        print(f"✗ Ranking failed: {e}")
-        return False
-    finally:
-        db.close_connection()
+def test_missing_uri_raises(monkeypatch):
+    monkeypatch.setattr(Db, 'load_dotenv', lambda: None)
+    monkeypatch.delenv('MONGO_URI', raising=False)
+    with pytest.raises(ValueError, match='MONGO_URI'):
+        ResumeDatabase()
 
 
-def test_get_all():
-    """Test get all with pagination"""
-    print("\n" + "="*60)
-    print("TEST 7: Get All Resumes (Pagination)")
-    print("="*60)
-    
-    db = ResumeDatabase()
-    
-    try:
-        resumes = db.get_all_resumes(limit=5, skip=0, sort_by='created_at', ascending=False)
-        print(f"✓ Retrieved {len(resumes)} resume(s)")
-        
-        for i, resume in enumerate(resumes, 1):
-            print(f"  {i}. {resume.get('name', 'Unknown')} - Created: {resume.get('created_at', 'N/A')}")
-        
-        return True
-        
-    except Exception as e:
-        print(f"✗ Get all failed: {e}")
-        return False
-    finally:
-        db.close_connection()
+def test_insert_and_get(db):
+    resume = make_resume()
+    result = db.insert_resume(resume)
+    assert result == {'success': True, 'id': 'test_resume_001', 'message': 'Resume inserted successfully'}
+    assert 'created_at' not in resume, "insert_resume must not mutate the caller's dict"
+
+    stored = db.get_resume('test_resume_001')
+    assert stored['name'] == 'Alice Johnson'
+    assert stored['created_at'] is not None and stored['updated_at'] is not None
 
 
-def test_count():
-    """Test count operation"""
-    print("\n" + "="*60)
-    print("TEST 8: Count Resumes")
-    print("="*60)
-    
-    db = ResumeDatabase()
-    
-    try:
-        total_count = db.get_resume_count()
-        python_count = db.get_resume_count({'skills': {'$in': ['Python']}})
-        
-        print(f"✓ Total resumes: {total_count}")
-        print(f"✓ Python developers: {python_count}")
-        
-        return True
-        
-    except Exception as e:
-        print(f"✗ Count failed: {e}")
-        return False
-    finally:
-        db.close_connection()
+def test_insert_generates_id(db):
+    result = db.insert_resume({'name': 'No Id'})
+    assert db.get_resume(result['id'])['name'] == 'No Id'
 
 
-def test_bulk_insert():
-    """Test bulk insert"""
-    print("\n" + "="*60)
-    print("TEST 9: Bulk Insert")
-    print("="*60)
-    
-    db = ResumeDatabase()
-    
-    try:
-        resumes = [
-            {
-                'name': 'Bob Smith',
-                'email_address': 'bob@example.com',
-                'skills': ['JavaScript', 'Node.js', 'React'],
-                'experience': [],
-                'education': [],
-                'projects': [],
-                'extras': []
-            },
-            {
-                'name': 'Carol White',
-                'email_address': 'carol@example.com',
-                'skills': ['Java', 'Spring Boot', 'AWS'],
-                'experience': [],
-                'education': [],
-                'projects': [],
-                'extras': []
-            }
-        ]
-        
-        result = db.bulk_insert_resumes(resumes)
-        print(f"✓ {result['message']}")
-        print(f"  IDs: {', '.join(result['inserted_ids'][:2])}...")
-        
-        return result['success']
-        
-    except Exception as e:
-        print(f"✗ Bulk insert failed: {e}")
-        return False
-    finally:
-        db.close_connection()
+def test_insert_empty_raises(db):
+    with pytest.raises(ValueError):
+        db.insert_resume({})
 
 
-def test_delete():
-    """Test delete operation"""
-    print("\n" + "="*60)
-    print("TEST 10: Delete Resume")
-    print("="*60)
-    
-    db = ResumeDatabase()
-    
-    try:
-        result = db.delete_resume('test_resume_001')
-        
-        if result['success']:
-            print(f"✓ Resume deleted")
-            print(f"  Deleted count: {result['deleted_count']}")
-            
-            # Verify deletion
-            resume = db.get_resume('test_resume_001')
-            if resume is None:
-                print("✓ Deletion verified - resume not found")
-                return True
-            else:
-                print("✗ Resume still exists after deletion")
-                return False
-        else:
-            print("✗ Delete failed")
-            return False
-            
-    except Exception as e:
-        print(f"✗ Delete failed: {e}")
-        return False
-    finally:
-        db.close_connection()
+def test_insert_duplicate_raises(db):
+    db.insert_resume(make_resume())
+    with pytest.raises(DuplicateKeyError):
+        db.insert_resume(make_resume())
 
 
-def run_all_tests():
-    """Run all tests"""
-    print("\n" + "#"*60)
-    print("# Resume Database API Test Suite")
-    print("#"*60)
-    
-    tests = [
-        test_connection,
-        test_insert,
-        test_get,
-        test_update,
-        test_search,
-        test_ranking,
-        test_get_all,
-        test_count,
-        test_bulk_insert,
-        test_delete
-    ]
-    
-    results = []
-    for test in tests:
-        try:
-            result = test()
-            results.append(result)
-        except Exception as e:
-            print(f"\n✗ Test crashed: {e}")
-            results.append(False)
-    
-    # Summary
-    print("\n" + "="*60)
-    print("TEST SUMMARY")
-    print("="*60)
-    
-    passed = sum(results)
-    total = len(results)
-    
-    print(f"Passed: {passed}/{total}")
-    print(f"Failed: {total - passed}/{total}")
-    
-    if passed == total:
-        print("\n🎉 All tests passed!")
-        return 0
-    else:
-        print(f"\n⚠️  {total - passed} test(s) failed")
-        return 1
+def test_get_missing_returns_none(db):
+    assert db.get_resume('does-not-exist') is None
+
+
+def test_update(db):
+    db.insert_resume(make_resume())
+    update = {'skills': ['Python', 'Docker']}
+    result = db.update_resume('test_resume_001', update)
+    assert result['success'] and result['matched_count'] == 1 and result['modified_count'] == 1
+    assert 'updated_at' not in update, "update_resume must not mutate the caller's dict"
+    assert db.get_resume('test_resume_001')['skills'] == ['Python', 'Docker']
+
+
+def test_update_ignores_id_field(db):
+    db.insert_resume(make_resume())
+    result = db.update_resume('test_resume_001', {'_id': 'test_resume_001', 'name': 'Alice J'})
+    assert result['success']
+    assert db.get_resume('test_resume_001')['name'] == 'Alice J'
+
+
+def test_update_missing_and_empty(db):
+    assert db.update_resume('nope', {'name': 'x'})['success'] is False
+    with pytest.raises(ValueError):
+        db.update_resume('nope', {})
+
+
+def test_update_upsert(db):
+    result = db.update_resume('upserted', {'name': 'New'}, upsert=True)
+    assert result['upserted_id'] == 'upserted'
+    assert db.get_resume('upserted')['name'] == 'New'
+
+
+def test_search_and_count(db):
+    db.insert_resume(make_resume())
+    db.insert_resume(make_resume(_id='js', name='Bob', skills=['JavaScript']))
+    results = db.search_resumes({'skills': {'$in': ['Python']}})
+    assert [r['name'] for r in results] == ['Alice Johnson']
+    assert db.get_resume_count() == 2
+    assert db.get_resume_count({'skills': {'$in': ['Python']}}) == 1
+
+
+def test_add_ranking_keeps_history_and_sets_score(db):
+    db.insert_resume(make_resume())
+    jd = 'Senior Full Stack Developer with Python and MongoDB'
+    assert db.add_ranking('test_resume_001', RANKING, jd)['success']
+    assert db.add_ranking('test_resume_001', {**RANKING, 'total_score': 50}, 'other jd')['success']
+
+    stored = db.get_resume('test_resume_001')
+    assert len(stored['rankings']) == 2
+    assert stored['rankings'][0]['job_description'] == jd
+    assert stored['total_score'] == 50
+    assert stored['latest_ranking']['job_description'] == 'other jd'
+    # resume content must be untouched by ranking
+    assert stored['skills'] == make_resume()['skills']
+
+
+def test_add_ranking_missing_resume(db):
+    assert db.add_ranking('nope', RANKING, 'jd')['success'] is False
+
+
+def test_get_top_resumes(db):
+    for i, score in enumerate([40, 90, 70]):
+        db.insert_resume(make_resume(_id=f'r{i}', name=f'C{i}'))
+        db.add_ranking(f'r{i}', {**RANKING, 'total_score': score}, 'jd')
+    db.insert_resume(make_resume(_id='unranked', name='U'))
+    assert [r['total_score'] for r in db.get_top_resumes(limit=2)] == [90, 70]
+
+
+def test_get_all_pagination(db):
+    for i in range(5):
+        db.insert_resume({'_id': f'p{i}', 'name': f'P{i}'})
+    page1 = db.get_all_resumes(limit=2, skip=0, sort_by='name', ascending=True)
+    page2 = db.get_all_resumes(limit=2, skip=2, sort_by='name', ascending=True)
+    assert [r['name'] for r in page1] == ['P0', 'P1']
+    assert [r['name'] for r in page2] == ['P2', 'P3']
+
+
+def test_bulk_insert(db):
+    resumes = [{'name': 'Bob Smith', 'skills': ['JavaScript']},
+               {'name': 'Carol White', 'skills': ['Java']}]
+    result = db.bulk_insert_resumes(resumes)
+    assert result['success'] and len(result['inserted_ids']) == 2
+    assert '_id' not in resumes[0], "bulk insert must not mutate the caller's dicts"
+    assert db.get_resume_count() == 2
+    with pytest.raises(ValueError):
+        db.bulk_insert_resumes([])
+
+
+def test_delete(db):
+    db.insert_resume(make_resume())
+    result = db.delete_resume('test_resume_001')
+    assert result['success'] and result['deleted_count'] == 1
+    assert db.get_resume('test_resume_001') is None
+    assert db.delete_resume('test_resume_001')['success'] is False
+
+
+def test_legacy_functions_with_collection(db):
+    coll = db.collection
+    Db.insert_resume({'_id': 'legacy_001', 'name': 'Legacy User'}, coll)
+    assert Db.get_resume('legacy_001', coll)['name'] == 'Legacy User'
+    Db.update_resume('legacy_001', {'name': 'Updated'}, coll)
+    assert Db.get_resume('legacy_001', coll)['name'] == 'Updated'
+    with pytest.raises(DuplicateKeyError):
+        Db.insert_resume({'_id': 'legacy_001', 'name': 'Dup'}, coll)
+    Db.delete_resume('legacy_001', coll)
+    assert Db.get_resume('legacy_001', coll) is None
+
+
+def test_legacy_functions_without_collection(db):
+    Db.insert_resume({'_id': 'legacy_002', 'name': 'Legacy'})
+    assert Db.get_resume('legacy_002')['name'] == 'Legacy'
+    Db.update_resume('legacy_002', {'name': 'L2'})
+    assert Db.get_resume('legacy_002')['name'] == 'L2'
+    Db.delete_resume('legacy_002')
+    assert Db.get_resume('legacy_002') is None
 
 
 if __name__ == "__main__":
-    exit_code = run_all_tests()
-    sys.exit(exit_code)
-
+    sys.exit(pytest.main([__file__, "-v"]))
