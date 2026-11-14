@@ -1,13 +1,14 @@
-from pymongo import MongoClient
+from pymongo import MongoClient, DESCENDING
 from pymongo.errors import (
-    PyMongoError, 
-    DuplicateKeyError, 
+    PyMongoError,
+    DuplicateKeyError,
     ConnectionFailure,
     OperationFailure
 )
+from bson import ObjectId
 from dotenv import load_dotenv
-from typing import Dict, List, Optional, Any, Union
-from datetime import datetime
+from typing import Dict, List, Optional, Any
+from datetime import datetime, timezone
 import os
 import logging
 
@@ -15,29 +16,46 @@ import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+DEFAULT_DB_NAME = 'ResumeAnalyzer'
+DEFAULT_COLLECTION_NAME = 'resumes'
+
+
+def _utcnow() -> datetime:
+    """Timezone-aware current UTC time (datetime.utcnow() is deprecated)."""
+    return datetime.now(timezone.utc)
+
 
 class ResumeDatabase:
     """
     Professional MongoDB CRUD API for Resume Management
-    
+
     Provides robust database operations with error handling,
     validation, and comprehensive CRUD functionality.
+
+    Can be used as a context manager so the connection is always closed:
+
+        with ResumeDatabase() as db:
+            db.get_resume('resume_001')
     """
-    
-    def __init__(self, db_name: str = 'ResumeAnalyzer', collection_name: str = 'resumes'):
+
+    def __init__(self, db_name: Optional[str] = None, collection_name: str = DEFAULT_COLLECTION_NAME):
         """
         Initialize database connection
-        
+
         Args:
-            db_name: Name of the MongoDB database
+            db_name: Name of the MongoDB database. Defaults to the MONGO_DB_NAME
+                environment variable, or 'ResumeAnalyzer' if that is unset.
             collection_name: Name of the collection to use
         """
         load_dotenv()
+        self.client = None
         self.mongo_uri = os.getenv("MONGO_URI")
-        
+
         if not self.mongo_uri:
             raise ValueError("MONGO_URI not found in environment variables")
-        
+
+        db_name = db_name or os.getenv("MONGO_DB_NAME") or DEFAULT_DB_NAME
+
         try:
             self.client = MongoClient(self.mongo_uri, serverSelectionTimeoutMS=5000)
             # Test connection
@@ -45,61 +63,65 @@ class ResumeDatabase:
             self.db = self.client[db_name]
             self.collection = self.db[collection_name]
             logger.info(f"Successfully connected to MongoDB: {db_name}.{collection_name}")
-        except ConnectionFailure as e:
+        except PyMongoError as e:
+            # ServerSelectionTimeoutError (the usual "server is down" error) is a
+            # subclass of ConnectionFailure; catch PyMongoError so auth errors
+            # are logged too, and don't leak the half-open client.
             logger.error(f"Failed to connect to MongoDB: {e}")
+            self.close_connection()
             raise
-    
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close_connection()
+        return False
+
     def insert_resume(self, resume: Dict[str, Any]) -> Dict[str, Any]:
         """
         Insert a new resume into the database
-        
+
         Args:
-            resume: Dictionary containing resume data
-            
+            resume: Dictionary containing resume data (not modified)
+
         Returns:
             Dictionary with success status and inserted ID
-            
+
         Raises:
             ValueError: If resume data is invalid
             DuplicateKeyError: If resume with same ID already exists
         """
         if not resume:
             raise ValueError("Resume data cannot be empty")
-        
-        # Add metadata
-        if '_id' not in resume:
-            resume['_id'] = self._generate_resume_id()
-        
-        resume['created_at'] = datetime.utcnow()
-        resume['updated_at'] = datetime.utcnow()
-        
+
+        document = self._with_metadata(resume)
+
         try:
-            # Check if resume already exists
-            if self.collection.find_one({'_id': resume['_id']}):
-                raise DuplicateKeyError(f"Resume with ID {resume['_id']} already exists")
-            
-            result = self.collection.insert_one(resume)
+            # insert_one raises DuplicateKeyError atomically on an existing _id,
+            # so no racy find-then-insert check is needed.
+            result = self.collection.insert_one(document)
             logger.info(f"Resume inserted successfully with ID: {result.inserted_id}")
-            
+
             return {
                 'success': True,
                 'id': str(result.inserted_id),
                 'message': 'Resume inserted successfully'
             }
         except DuplicateKeyError as e:
-            logger.error(f"Duplicate resume ID: {e}")
+            logger.error(f"Duplicate resume ID {document['_id']}: {e}")
             raise
         except PyMongoError as e:
             logger.error(f"Database error during insert: {e}")
             raise
-    
+
     def get_resume(self, resume_id: str) -> Optional[Dict[str, Any]]:
         """
         Retrieve a resume by ID
-        
+
         Args:
             resume_id: The unique identifier of the resume
-            
+
         Returns:
             Resume dictionary if found, None otherwise
         """
@@ -113,18 +135,18 @@ class ResumeDatabase:
         except PyMongoError as e:
             logger.error(f"Database error during retrieval: {e}")
             raise
-    
-    def get_all_resumes(self, limit: int = 100, skip: int = 0, 
-                       sort_by: str = 'created_at', ascending: bool = False) -> List[Dict[str, Any]]:
+
+    def get_all_resumes(self, limit: int = 100, skip: int = 0,
+                        sort_by: str = 'created_at', ascending: bool = False) -> List[Dict[str, Any]]:
         """
         Retrieve all resumes with pagination and sorting
-        
+
         Args:
             limit: Maximum number of resumes to return
             skip: Number of resumes to skip
             sort_by: Field to sort by
             ascending: Sort order (True for ascending, False for descending)
-            
+
         Returns:
             List of resume dictionaries
         """
@@ -136,33 +158,56 @@ class ResumeDatabase:
         except PyMongoError as e:
             logger.error(f"Database error during retrieval: {e}")
             raise
-    
-    def update_resume(self, resume_id: str, update_data: Dict[str, Any], 
-                     upsert: bool = False) -> Dict[str, Any]:
+
+    def get_top_resumes(self, limit: int = 10) -> List[Dict[str, Any]]:
+        """
+        Retrieve the highest scoring ranked resumes (by their latest ranking)
+
+        Args:
+            limit: Maximum number of resumes to return
+
+        Returns:
+            List of resume dictionaries sorted by total_score, highest first
+        """
+        try:
+            resumes = list(
+                self.collection.find({'total_score': {'$exists': True}})
+                .sort('total_score', DESCENDING)
+                .limit(limit)
+            )
+            logger.info(f"Retrieved top {len(resumes)} resumes")
+            return resumes
+        except PyMongoError as e:
+            logger.error(f"Database error during retrieval: {e}")
+            raise
+
+    def update_resume(self, resume_id: str, update_data: Dict[str, Any],
+                      upsert: bool = False) -> Dict[str, Any]:
         """
         Update an existing resume
-        
+
         Args:
             resume_id: The unique identifier of the resume
-            update_data: Dictionary containing fields to update
+            update_data: Dictionary containing fields to update (not modified)
             upsert: If True, insert the document if it doesn't exist
-            
+
         Returns:
             Dictionary with success status and modified count
         """
         if not update_data:
             raise ValueError("Update data cannot be empty")
-        
-        # Add updated timestamp
-        update_data['updated_at'] = datetime.utcnow()
-        
+
+        # Never try to $set the immutable _id field; add updated timestamp
+        update_fields = {k: v for k, v in update_data.items() if k != '_id'}
+        update_fields['updated_at'] = _utcnow()
+
         try:
             result = self.collection.update_one(
                 {'_id': resume_id},
-                {'$set': update_data},
+                {'$set': update_fields},
                 upsert=upsert
             )
-            
+
             if result.matched_count == 0 and not upsert:
                 logger.warning(f"Resume not found for update: {resume_id}")
                 return {
@@ -171,7 +216,7 @@ class ResumeDatabase:
                     'matched_count': 0,
                     'modified_count': 0
                 }
-            
+
             logger.info(f"Resume updated: {resume_id}, Modified: {result.modified_count}")
             return {
                 'success': True,
@@ -183,20 +228,20 @@ class ResumeDatabase:
         except PyMongoError as e:
             logger.error(f"Database error during update: {e}")
             raise
-    
+
     def delete_resume(self, resume_id: str) -> Dict[str, Any]:
         """
         Delete a resume by ID
-        
+
         Args:
             resume_id: The unique identifier of the resume
-            
+
         Returns:
             Dictionary with success status and deleted count
         """
         try:
             result = self.collection.delete_one({'_id': resume_id})
-            
+
             if result.deleted_count == 0:
                 logger.warning(f"Resume not found for deletion: {resume_id}")
                 return {
@@ -204,7 +249,7 @@ class ResumeDatabase:
                     'message': 'Resume not found',
                     'deleted_count': 0
                 }
-            
+
             logger.info(f"Resume deleted: {resume_id}")
             return {
                 'success': True,
@@ -214,15 +259,15 @@ class ResumeDatabase:
         except PyMongoError as e:
             logger.error(f"Database error during deletion: {e}")
             raise
-    
+
     def search_resumes(self, query: Dict[str, Any], limit: int = 50) -> List[Dict[str, Any]]:
         """
         Search resumes based on custom query
-        
+
         Args:
             query: MongoDB query dictionary
             limit: Maximum number of results to return
-            
+
         Returns:
             List of matching resume dictionaries
         """
@@ -233,42 +278,50 @@ class ResumeDatabase:
         except PyMongoError as e:
             logger.error(f"Database error during search: {e}")
             raise
-    
-    def add_ranking(self, resume_id: str, ranking_data: Dict[str, Any], 
-                   job_description: str) -> Dict[str, Any]:
+
+    def add_ranking(self, resume_id: str, ranking_data: Dict[str, Any],
+                    job_description: str) -> Dict[str, Any]:
         """
         Add ranking information to a resume
-        
+
+        The ranking is appended to the resume's ``rankings`` history, and the
+        resume's top-level ``latest_ranking`` and ``total_score`` fields are
+        updated so resumes can be queried/sorted by score.
+
         Args:
             resume_id: The unique identifier of the resume
             ranking_data: Dictionary containing ranking scores and justifications
             job_description: The job description used for ranking
-            
+
         Returns:
             Dictionary with success status
         """
+        now = _utcnow()
         ranking_entry = {
             'ranking': ranking_data,
             'job_description': job_description,
-            'ranked_at': datetime.utcnow()
+            'ranked_at': now
         }
-        
+        set_fields: Dict[str, Any] = {'updated_at': now, 'latest_ranking': ranking_entry}
+        if 'total_score' in ranking_data:
+            set_fields['total_score'] = ranking_data['total_score']
+
         try:
             result = self.collection.update_one(
                 {'_id': resume_id},
                 {
                     '$push': {'rankings': ranking_entry},
-                    '$set': {'updated_at': datetime.utcnow()}
+                    '$set': set_fields
                 }
             )
-            
+
             if result.matched_count == 0:
                 logger.warning(f"Resume not found for adding ranking: {resume_id}")
                 return {
                     'success': False,
                     'message': 'Resume not found'
                 }
-            
+
             logger.info(f"Ranking added to resume: {resume_id}")
             return {
                 'success': True,
@@ -277,14 +330,14 @@ class ResumeDatabase:
         except PyMongoError as e:
             logger.error(f"Database error during ranking addition: {e}")
             raise
-    
+
     def get_resume_count(self, query: Optional[Dict[str, Any]] = None) -> int:
         """
         Get count of resumes matching query
-        
+
         Args:
             query: Optional MongoDB query dictionary
-            
+
         Returns:
             Count of matching documents
         """
@@ -295,31 +348,26 @@ class ResumeDatabase:
         except PyMongoError as e:
             logger.error(f"Database error during count: {e}")
             raise
-    
+
     def bulk_insert_resumes(self, resumes: List[Dict[str, Any]]) -> Dict[str, Any]:
         """
         Insert multiple resumes at once
-        
+
         Args:
-            resumes: List of resume dictionaries
-            
+            resumes: List of resume dictionaries (not modified)
+
         Returns:
             Dictionary with success status and inserted IDs
         """
         if not resumes:
             raise ValueError("Resume list cannot be empty")
-        
-        # Add metadata to all resumes
-        for resume in resumes:
-            if '_id' not in resume:
-                resume['_id'] = self._generate_resume_id()
-            resume['created_at'] = datetime.utcnow()
-            resume['updated_at'] = datetime.utcnow()
-        
+
+        documents = [self._with_metadata(resume) for resume in resumes]
+
         try:
-            result = self.collection.insert_many(resumes, ordered=False)
+            result = self.collection.insert_many(documents, ordered=False)
             logger.info(f"Bulk insert: {len(result.inserted_ids)} resumes inserted")
-            
+
             return {
                 'success': True,
                 'message': f'{len(result.inserted_ids)} resumes inserted',
@@ -328,20 +376,30 @@ class ResumeDatabase:
         except PyMongoError as e:
             logger.error(f"Database error during bulk insert: {e}")
             raise
-    
+
+    def _with_metadata(self, resume: Dict[str, Any]) -> Dict[str, Any]:
+        """Return a copy of ``resume`` with an _id and timestamps added."""
+        document = dict(resume)
+        document.setdefault('_id', self._generate_resume_id())
+        now = _utcnow()
+        document['created_at'] = now
+        document['updated_at'] = now
+        return document
+
     def _generate_resume_id(self) -> str:
         """Generate a unique resume ID"""
-        from bson import ObjectId
         return str(ObjectId())
-    
+
     def close_connection(self):
-        """Close the MongoDB connection"""
-        if self.client:
+        """Close the MongoDB connection (safe to call more than once)"""
+        if self.client is not None:
             self.client.close()
+            self.client = None
             logger.info("MongoDB connection closed")
 
 
 # Legacy function support (for backward compatibility)
+# NOTE: pymongo Collection objects raise on bool(), so always compare to None.
 def load_mongodb():
     """Legacy function to load MongoDB collection"""
     db = ResumeDatabase()
@@ -350,42 +408,39 @@ def load_mongodb():
 
 def insert_resume(resume: dict, collection=None):
     """Legacy function to insert resume"""
-    if collection:
-        # Direct collection usage
-        if '_id' in resume and collection.find_one({'_id': resume['_id']}):
-            raise DuplicateKeyError(f"Resume with ID {resume['_id']} already exists")
-        resume['created_at'] = datetime.utcnow()
-        resume['updated_at'] = datetime.utcnow()
+    if collection is not None:
+        # Direct collection usage; insert_one raises DuplicateKeyError itself
+        now = _utcnow()
+        resume['created_at'] = now
+        resume['updated_at'] = now
         collection.insert_one(resume)
     else:
-        # Use new API
-        db = ResumeDatabase()
-        db.insert_resume(resume)
+        with ResumeDatabase() as db:
+            db.insert_resume(resume)
 
 
 def get_resume(resume_id: str, collection=None):
     """Legacy function to get resume"""
-    if collection:
+    if collection is not None:
         return collection.find_one({'_id': resume_id})
-    else:
-        db = ResumeDatabase()
+    with ResumeDatabase() as db:
         return db.get_resume(resume_id)
 
 
 def update_resume(resume_id: str, resume: dict, collection=None):
     """Legacy function to update resume"""
-    if collection:
-        resume['updated_at'] = datetime.utcnow()
+    if collection is not None:
+        resume['updated_at'] = _utcnow()
         collection.update_one({'_id': resume_id}, {'$set': resume})
     else:
-        db = ResumeDatabase()
-        db.update_resume(resume_id, resume)
+        with ResumeDatabase() as db:
+            db.update_resume(resume_id, resume)
 
 
 def delete_resume(resume_id: str, collection=None):
     """Legacy function to delete resume"""
-    if collection:
+    if collection is not None:
         collection.delete_one({'_id': resume_id})
     else:
-        db = ResumeDatabase()
-        db.delete_resume(resume_id)
+        with ResumeDatabase() as db:
+            db.delete_resume(resume_id)
