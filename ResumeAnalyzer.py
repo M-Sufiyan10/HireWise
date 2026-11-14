@@ -70,15 +70,18 @@ Return ONLY a valid JSON object with exactly these keys:
 Use null for missing single values and [] for missing lists. Return ONLY the JSON object, no additional text or formatting."""
 
 
-def load_pdf_as_gemini_file(path) -> Dict[str, str]:
-    with open(path, "rb") as f:
-        pdf_bytes = f.read()
+def pdf_bytes_to_gemini_file(pdf_bytes: bytes, name: str = "file") -> Dict[str, str]:
     if not pdf_bytes.startswith(b"%PDF"):
-        raise ValueError(f"{path} is not a valid PDF file")
+        raise ValueError(f"{name} is not a valid PDF file")
     return {
         "mime_type": "application/pdf",
         "data": base64.b64encode(pdf_bytes).decode()
     }
+
+
+def load_pdf_as_gemini_file(path) -> Dict[str, str]:
+    with open(path, "rb") as f:
+        return pdf_bytes_to_gemini_file(f.read(), str(path))
 
 
 def _canonical_key(key: str) -> str:
@@ -164,28 +167,43 @@ def collect_pdf_paths(inputs: List[str]) -> List[Path]:
     return unique
 
 
-def process_resume(path, job_description: str, db: ResumeDatabase, llm=None) -> Dict[str, Any]:
-    """Parse, store and rank a single resume. Returns a result summary."""
-    resume = parse_resume(load_pdf_as_gemini_file(path), llm=llm)
-    resume["source_file"] = Path(path).name
+def process_resume_bytes(pdf_bytes: bytes, filename: str, job_description: str,
+                         db: ResumeDatabase, llm=None, verbose: bool = True) -> Dict[str, Any]:
+    """Parse, store and rank a single resume given its PDF bytes.
+
+    Returns a summary with the file name, stored id, candidate name, total score,
+    full ranking breakdown, parsed resume and any ranking error.
+    """
+    log = print if verbose else (lambda *a, **k: None)
+    resume = parse_resume(pdf_bytes_to_gemini_file(pdf_bytes, filename), llm=llm)
+    resume["source_file"] = filename
 
     result = db.insert_resume(resume)
     resume_id = result["id"]
     name = resume.get("name") or "Unknown"
-    print(f"✓ Resume inserted: {name} (ID: {resume_id})")
+    log(f"✓ Resume inserted: {name} (ID: {resume_id})")
 
-    summary = {"file": Path(path).name, "id": resume_id, "name": name, "total_score": None, "error": None}
+    summary = {"file": filename, "id": resume_id, "name": name, "total_score": None,
+               "ranking": None, "resume": resume, "error": None}
     try:
         ranking = rank_resume(resume, job_description, llm=llm)
     except Exception as e:  # keep the parsed resume, but report the failure
         summary["error"] = f"ranking failed: {e}"
-        print(f"✗ Error ranking resume: {e}")
+        log(f"✗ Error ranking resume: {e}")
         return summary
 
     db.add_ranking(resume_id, ranking, job_description)
     summary["total_score"] = ranking["total_score"]
-    print(f"✓ Total score: {ranking['total_score']} / 100")
+    summary["ranking"] = ranking
+    log(f"✓ Total score: {ranking['total_score']} / 100")
     return summary
+
+
+def process_resume(path, job_description: str, db: ResumeDatabase, llm=None) -> Dict[str, Any]:
+    """Parse, store and rank a single resume file. Returns a result summary."""
+    with open(path, "rb") as f:
+        pdf_bytes = f.read()
+    return process_resume_bytes(pdf_bytes, Path(path).name, job_description, db, llm=llm)
 
 
 def print_leaderboard(results: List[Dict[str, Any]]):

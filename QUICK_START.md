@@ -17,7 +17,18 @@ MONGO_URI=mongodb://localhost:27017/
 GOOGLE_API_KEY=your-gemini-api-key   # needed for parsing/ranking resumes
 ```
 
-### Run the Resume Pipeline
+### Run the Web UI
+
+```bash
+streamlit run app.py
+```
+
+Opens http://localhost:8501. Paste a job description, upload resume PDFs and
+click **Analyze & rank** to get a leaderboard with a per-category score
+breakdown. The **Candidates** tab lets you search, review and delete every
+resume stored in MongoDB.
+
+### Run the Resume Pipeline (CLI)
 
 ```bash
 # Rank every PDF in a folder against a job description

@@ -18,4 +18,5 @@ pypdf
 pymongo
 fastapi
 uvicorn
+streamlit
 pytest
