@@ -1,0 +1,13 @@
+# Production-safe defaults: users never see backend details.
+# For local development you can override per run, e.g.
+#   streamlit run app.py --client.toolbarMode developer --client.showErrorDetails full
+
+[client]
+# Show only a generic message in the browser if something crashes;
+# tracebacks and exception details are printed to the server console only.
+showErrorDetails = "none"
+# Hide developer options (Deploy, Rerun, Clear cache) from the toolbar/menu.
+toolbarMode = "viewer"
+
+[browser]
+gatherUsageStats = false

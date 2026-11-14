@@ -70,9 +70,13 @@ Return ONLY a valid JSON object with exactly these keys:
 Use null for missing single values and [] for missing lists. Return ONLY the JSON object, no additional text or formatting."""
 
 
+class InvalidPDFError(ValueError):
+    """Raised when an uploaded/loaded file is not a PDF."""
+
+
 def pdf_bytes_to_gemini_file(pdf_bytes: bytes, name: str = "file") -> Dict[str, str]:
     if not pdf_bytes.startswith(b"%PDF"):
-        raise ValueError(f"{name} is not a valid PDF file")
+        raise InvalidPDFError(f"{name} is not a valid PDF file")
     return {
         "mime_type": "application/pdf",
         "data": base64.b64encode(pdf_bytes).decode()

@@ -3,20 +3,27 @@
 Run with:
     streamlit run app.py
 """
-import os
+import logging
 import re
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
 import streamlit as st
-from pymongo.errors import ServerSelectionTimeoutError
 
 from Db import ResumeDatabase
-from Load_apis import DEFAULT_MODEL
 from RankResume import SCORE_WEIGHTS, get_llm
-from ResumeAnalyzer import process_resume_bytes
+from ResumeAnalyzer import InvalidPDFError, process_resume_bytes
 
 st.set_page_config(page_title="HireWise", page_icon="🧭", layout="wide")
+
+# Technical details (connection errors, API failures) go to the server log
+# only; users only ever see the friendly messages below.
+logger = logging.getLogger("hirewise.app")
+
+UNAVAILABLE_MSG = "HireWise is temporarily unavailable. Please try again in a few minutes."
+ANALYZE_FAILED_MSG = "We couldn't analyze this resume. Please try again."
+SCORING_FAILED_MSG = "The resume was saved, but scoring failed. Please try again."
+INVALID_PDF_MSG = "This file isn't a valid PDF."
 
 CATEGORY_LABELS = {
     "skills": "Skills",
@@ -35,20 +42,20 @@ def get_db() -> ResumeDatabase:
     return ResumeDatabase()
 
 
-def connect_db() -> tuple[Optional[ResumeDatabase], Optional[str]]:
+def connect_db() -> Optional[ResumeDatabase]:
     try:
-        return get_db(), None
-    except ServerSelectionTimeoutError:
-        return None, "can't reach the server at MONGO_URI. Is MongoDB running?"
-    except Exception as e:
-        return None, str(e).split(",")[0]
+        return get_db()
+    except Exception:
+        logger.exception("Database connection failed")
+        return None
 
 
-def connect_llm() -> tuple[Any, Optional[str]]:
+def connect_llm() -> Any:
     try:
-        return get_llm(), None
-    except Exception as e:
-        return None, str(e)
+        return get_llm()
+    except Exception:
+        logger.exception("LLM initialisation failed")
+        return None
 
 
 # --------------------------------------------------------------------------- #
@@ -177,25 +184,13 @@ TABLE_CONFIG = {
 # --------------------------------------------------------------------------- #
 # Sidebar
 # --------------------------------------------------------------------------- #
-db, db_error = connect_db()
-llm, llm_error = connect_llm()
+db = connect_db()
+llm = connect_llm()
+available = db is not None and llm is not None
 
 with st.sidebar:
     st.title("🧭 HireWise")
     st.caption("AI resume screening and ranking")
-
-    st.subheader("Status")
-    if llm_error:
-        st.error(f"Gemini: {llm_error}", icon="🔑")
-    else:
-        st.success(f"Gemini key configured · `{os.getenv('GEMINI_MODEL', DEFAULT_MODEL)}`", icon="✅")
-    if db_error:
-        st.error(f"MongoDB unavailable: {db_error}", icon="🗄️")
-        if st.button("Retry connection"):
-            get_db.clear()
-            st.rerun()
-    else:
-        st.success(f"MongoDB connected · `{db.db.name}`", icon="✅")
 
     st.subheader("Scoring rubric")
     st.dataframe(
@@ -209,6 +204,14 @@ with st.sidebar:
 # Main
 # --------------------------------------------------------------------------- #
 st.title("Resume screening")
+
+if not available:
+    st.error(UNAVAILABLE_MSG, icon="⚠️")
+    if st.button("Try again"):
+        get_db.clear()
+        st.rerun()
+    st.stop()
+
 rank_tab, saved_tab = st.tabs(["📄 Rank resumes", "🗂️ Candidates"])
 
 with rank_tab:
@@ -219,9 +222,7 @@ with rank_tab:
     )
     uploads = st.file_uploader("Resumes (PDF)", type=["pdf"], accept_multiple_files=True)
 
-    ready = bool(job_description.strip()) and bool(uploads) and db is not None and llm is not None
-    if db is None or llm is None:
-        st.warning("Fix the connection issues shown in the sidebar to start ranking.")
+    ready = bool(job_description.strip()) and bool(uploads)
 
     if st.button("Analyze & rank", type="primary", disabled=not ready):
         results: List[Dict[str, Any]] = []
@@ -233,9 +234,16 @@ with rank_tab:
                 try:
                     result = process_resume_bytes(upload.getvalue(), upload.name,
                                                   job_description.strip(), db, llm=llm, verbose=False)
-                except Exception as e:
+                    if result["error"]:  # parsed and saved, but scoring failed
+                        logger.error("Scoring failed for %s: %s", upload.name, result["error"])
+                        result["error"] = SCORING_FAILED_MSG
+                except InvalidPDFError:
                     result = {"file": upload.name, "name": None, "ranking": None,
-                              "total_score": None, "resume": None, "error": str(e)}
+                              "total_score": None, "resume": None, "error": INVALID_PDF_MSG}
+                except Exception:
+                    logger.exception("Failed to process %s", upload.name)
+                    result = {"file": upload.name, "name": None, "ranking": None,
+                              "total_score": None, "resume": None, "error": ANALYZE_FAILED_MSG}
                 if result["error"]:
                     st.write(f"⚠️ {upload.name}: {result['error']}")
                 else:
@@ -277,68 +285,71 @@ with rank_tab:
                 render_candidate(r["resume"], r.get("ranking"), st.session_state.get("results_jd"))
 
 with saved_tab:
-    if db is None:
-        st.warning("MongoDB is not connected.")
+    f1, f2 = st.columns([3, 1])
+    search = f1.text_input("Search", placeholder="Name or skill, e.g. Python", label_visibility="collapsed")
+    sort = f2.selectbox("Sort by", ["Highest score", "Newest"], label_visibility="collapsed")
+
+    query: Dict[str, Any] = {}
+    if search.strip():
+        pattern = {"$regex": re.escape(search.strip()), "$options": "i"}
+        query = {"$or": [{"name": pattern}, {"skills": pattern}]}
+
+    sort_field = "total_score" if sort == "Highest score" else "created_at"
+    try:
+        docs = list(db.collection.find(query).sort([(sort_field, -1), ("created_at", -1)]).limit(200))
+    except Exception:
+        logger.exception("Failed to load candidates")
+        st.error("Couldn't load candidates right now. Please try again.")
+        docs = []
+
+    if not docs:
+        st.info("No candidates found." if search else "No candidates yet — rank some resumes first.")
     else:
-        f1, f2 = st.columns([3, 1])
-        search = f1.text_input("Search", placeholder="Name or skill, e.g. Python", label_visibility="collapsed")
-        sort = f2.selectbox("Sort by", ["Highest score", "Newest"], label_visibility="collapsed")
+        table = pd.DataFrame([{
+            "Candidate": d.get("name") or "Unknown",
+            "Score": d.get("total_score"),
+            "Email": d.get("email_address") if isinstance(d.get("email_address"), str) else None,
+            "Skills": ", ".join(map(str, (d.get("skills") or [])[:8])),
+            "Rankings": len(d.get("rankings") or []),
+            "Added": d.get("created_at"),
+        } for d in docs])
+        st.caption(f"{len(docs)} candidate(s)")
+        st.dataframe(table, hide_index=True, width="stretch", column_config={
+            "Score": st.column_config.ProgressColumn("Score", min_value=0, max_value=100, format="%.0f"),
+            "Added": st.column_config.DatetimeColumn("Added", format="YYYY-MM-DD HH:mm"),
+        })
 
-        query: Dict[str, Any] = {}
-        if search.strip():
-            pattern = {"$regex": re.escape(search.strip()), "$options": "i"}
-            query = {"$or": [{"name": pattern}, {"skills": pattern}]}
+        options = {str(d["_id"]): d for d in docs}
+        selected = st.selectbox(
+            "View candidate",
+            list(options),
+            format_func=lambda i: f"{options[i].get('name') or 'Unknown'} — "
+                                  f"{_fmt_score(options[i].get('total_score'))} / 100"
+                                  + (f" ({options[i]['source_file']})" if options[i].get("source_file") else ""),
+        )
+        doc = options[selected]
+        latest = doc.get("latest_ranking") or {}
+        with st.container(border=True):
+            st.subheader(doc.get("name") or "Unknown")
+            render_candidate(doc, latest.get("ranking"), latest.get("job_description"))
 
-        sort_field = "total_score" if sort == "Highest score" else "created_at"
-        try:
-            docs = list(db.collection.find(query).sort([(sort_field, -1), ("created_at", -1)]).limit(200))
-        except Exception as e:
-            st.error(f"Could not load candidates: {e}")
-            docs = []
+            history = doc.get("rankings") or []
+            if len(history) > 1:
+                with st.expander(f"Ranking history ({len(history)})"):
+                    st.dataframe(pd.DataFrame([{
+                        "Ranked at": h.get("ranked_at"),
+                        "Score": (h.get("ranking") or {}).get("total_score"),
+                        "Job description": (h.get("job_description") or "")[:120],
+                    } for h in history]), hide_index=True, width="stretch")
 
-        if not docs:
-            st.info("No candidates found." if search else "No candidates yet — rank some resumes first.")
-        else:
-            table = pd.DataFrame([{
-                "Candidate": d.get("name") or "Unknown",
-                "Score": d.get("total_score"),
-                "Email": d.get("email_address") if isinstance(d.get("email_address"), str) else None,
-                "Skills": ", ".join(map(str, (d.get("skills") or [])[:8])),
-                "Rankings": len(d.get("rankings") or []),
-                "Added": d.get("created_at"),
-            } for d in docs])
-            st.caption(f"{len(docs)} candidate(s)")
-            st.dataframe(table, hide_index=True, width="stretch", column_config={
-                "Score": st.column_config.ProgressColumn("Score", min_value=0, max_value=100, format="%.0f"),
-                "Added": st.column_config.DatetimeColumn("Added", format="YYYY-MM-DD HH:mm"),
-            })
-
-            options = {str(d["_id"]): d for d in docs}
-            selected = st.selectbox(
-                "View candidate",
-                list(options),
-                format_func=lambda i: f"{options[i].get('name') or 'Unknown'} — "
-                                      f"{_fmt_score(options[i].get('total_score'))} / 100 "
-                                      f"({options[i].get('source_file') or i})",
-            )
-            doc = options[selected]
-            latest = doc.get("latest_ranking") or {}
-            with st.container(border=True):
-                st.subheader(doc.get("name") or "Unknown")
-                render_candidate(doc, latest.get("ranking"), latest.get("job_description"))
-
-                history = doc.get("rankings") or []
-                if len(history) > 1:
-                    with st.expander(f"Ranking history ({len(history)})"):
-                        st.dataframe(pd.DataFrame([{
-                            "Ranked at": h.get("ranked_at"),
-                            "Score": (h.get("ranking") or {}).get("total_score"),
-                            "Job description": (h.get("job_description") or "")[:120],
-                        } for h in history]), hide_index=True, width="stretch")
-
-                with st.popover("🗑️ Delete candidate"):
-                    st.write(f"Permanently delete **{doc.get('name') or 'this candidate'}**?")
-                    if st.button("Yes, delete", type="primary", key=f"del-{selected}"):
+            with st.popover("🗑️ Delete candidate"):
+                st.write(f"Permanently delete **{doc.get('name') or 'this candidate'}**?")
+                if st.button("Yes, delete", type="primary", key=f"del-{selected}"):
+                    try:
                         db.delete_resume(selected)
+                    except Exception:
+                        logger.exception("Failed to delete candidate %s", selected)
+                        st.error("Couldn't delete this candidate. Please try again.")
+                    else:
                         st.toast("Candidate deleted")
                         st.rerun()

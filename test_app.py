@@ -29,14 +29,32 @@ def analyze_button(at):
     return next(b for b in at.button if b.label == "Analyze & rank")
 
 
-def test_shows_config_errors_without_key_or_db(no_dotenv, monkeypatch):
+BACKEND_TERMS = ("mongo", "gemini", "google_api_key", "api key", "database", "model", "connected")
+
+
+def page_text(at) -> str:
+    """The app's own UI text (titles, alerts, buttons), lower-cased.
+
+    Markdown and captions are excluded because they render candidate content
+    (skills, score justifications) that may legitimately mention "MongoDB".
+    """
+    parts = []
+    for kind in ("title", "header", "subheader", "error",
+                 "warning", "info", "success", "text"):
+        parts += [str(el.value) for el in getattr(at, kind)]
+    parts += [b.label for b in at.button]
+    return " ".join(parts).lower()
+
+
+def test_unavailable_backend_shows_generic_message(no_dotenv, monkeypatch):
     monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
     monkeypatch.setenv("MONGO_URI", "mongodb://localhost:1/?serverSelectionTimeoutMS=500")
     at = run_app()
-    errors = " ".join(e.value for e in at.error)
-    assert "GOOGLE_API_KEY" in errors
-    assert "Is MongoDB running?" in errors
-    assert analyze_button(at).disabled
+    assert any("temporarily unavailable" in e.value for e in at.error)
+    text = page_text(at)
+    assert not [t for t in BACKEND_TERMS if t in text], text
+    assert not any(b.label == "Analyze & rank" for b in at.button)  # nothing usable is shown
+    assert any(b.label == "Try again" for b in at.button)
 
 
 def test_ready_state_lists_saved_candidates(no_dotenv, monkeypatch, db):
@@ -46,6 +64,8 @@ def test_ready_state_lists_saved_candidates(no_dotenv, monkeypatch, db):
 
     at = run_app()
     assert not at.error
+    text = page_text(at)
+    assert not [t for t in BACKEND_TERMS if t in text], text
     # Needs a job description and uploaded PDFs before it can run
     assert analyze_button(at).disabled
     assert any("1 candidate(s)" in c.value for c in at.caption)
