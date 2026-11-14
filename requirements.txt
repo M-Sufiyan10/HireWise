@@ -13,8 +13,9 @@ trustcall
 langgraph-cli[inmem]
 langchain-google-genai
 matplotlib
-dotenv
+python-dotenv
 pypdf
 pymongo
 fastapi
 uvicorn
+pytest

@@ -30,7 +30,12 @@ Create a `.env` file in your project root:
 MONGO_URI=mongodb://localhost:27017/
 # or for MongoDB Atlas:
 # MONGO_URI=mongodb+srv://username:password@cluster.mongodb.net/
+
+# Optional: database name (default: ResumeAnalyzer)
+# MONGO_DB_NAME=ResumeAnalyzer
 ```
+
+See `.env.example` for every supported variable.
 
 ## 🚀 Quick Start
 
@@ -70,18 +75,13 @@ db.close_connection()
 
 ### Context Manager (Recommended)
 
+`ResumeDatabase` is a context manager, so the connection is always closed:
+
 ```python
 from Db import ResumeDatabase
 
-class ResumeDatabaseContext(ResumeDatabase):
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.close_connection()
-
 # Automatic connection cleanup
-with ResumeDatabaseContext() as db:
+with ResumeDatabase() as db:
     resume = db.get_resume('resume_001')
     # Connection closes automatically
 ```
@@ -93,18 +93,18 @@ with ResumeDatabaseContext() as db:
 #### Constructor
 
 ```python
-db = ResumeDatabase(db_name='ResumeAnalyzer', collection_name='resumes')
+db = ResumeDatabase(db_name=None, collection_name='resumes')
 ```
 
 **Parameters:**
 
-- `db_name` (str): MongoDB database name (default: 'ResumeAnalyzer')
+- `db_name` (str): MongoDB database name (default: the `MONGO_DB_NAME` env var, else 'ResumeAnalyzer')
 - `collection_name` (str): Collection name (default: 'resumes')
 
 **Raises:**
 
 - `ValueError`: If MONGO_URI not found in environment
-- `ConnectionFailure`: If unable to connect to MongoDB
+- `ConnectionFailure` / `PyMongoError`: If unable to connect to MongoDB
 
 ---
 
@@ -300,6 +300,10 @@ results = db.search_resumes({
 
 Add ranking information to a resume (supports multiple rankings).
 
+The entry is appended to the resume's `rankings` history, and the resume's
+top-level `latest_ranking` and `total_score` fields are set, so resumes can be
+queried and sorted by score (e.g. `{'total_score': {'$gte': 70}}`).
+
 **Parameters:**
 
 - `resume_id`: Unique identifier of the resume
@@ -329,6 +333,18 @@ ranking = {
 
 job_desc = "Looking for Full Stack Developer with Python"
 result = db.add_ranking('resume_001', ranking, job_desc)
+```
+
+---
+
+#### `get_top_resumes(limit: int = 10) -> List[Dict[str, Any]]`
+
+Get the highest scoring ranked resumes (by `total_score`, highest first).
+Resumes that have never been ranked are excluded.
+
+```python
+for resume in db.get_top_resumes(limit=5):
+    print(resume['name'], resume['total_score'])
 ```
 
 ---
@@ -594,41 +610,14 @@ finally:
 
 ## 🧪 Testing
 
-```python
-def test_database_operations():
-    db = ResumeDatabase()
+The test suite uses pytest and runs against an isolated `HireWise_test`
+database (override with `TEST_MONGO_DB_NAME`) that is dropped after each test,
+so it never touches real data. DB tests are skipped if MongoDB is unreachable.
 
-    # Test insert
-    test_resume = {
-        '_id': 'test_001',
-        'name': 'Test User',
-        'skills': ['Python'],
-        'experience': [],
-        'education': [],
-        'projects': [],
-        'extras': []
-    }
-
-    result = db.insert_resume(test_resume)
-    assert result['success'] == True
-
-    # Test get
-    resume = db.get_resume('test_001')
-    assert resume['name'] == 'Test User'
-
-    # Test update
-    result = db.update_resume('test_001', {'skills': ['Python', 'MongoDB']})
-    assert result['modified_count'] == 1
-
-    # Test delete
-    result = db.delete_resume('test_001')
-    assert result['deleted_count'] == 1
-
-    db.close_connection()
-    print("All tests passed!")
-
-if __name__ == "__main__":
-    test_database_operations()
+```bash
+pip install -r requirements.txt
+pytest            # all tests
+pytest test_db.py # database API only
 ```
 
 ---

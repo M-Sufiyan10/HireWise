@@ -10,11 +10,28 @@ pip install pymongo python-dotenv
 
 ### 2. Configure Environment
 
-Create `.env` file:
+Copy `.env.example` to `.env` and fill it in:
 
 ```env
 MONGO_URI=mongodb://localhost:27017/
+GOOGLE_API_KEY=your-gemini-api-key   # needed for parsing/ranking resumes
 ```
+
+### Run the Resume Pipeline
+
+```bash
+# Rank every PDF in a folder against a job description
+python ResumeAnalyzer.py resumes/ -j "Senior Python developer with MongoDB"
+
+# Specific files, job description read from a file
+python ResumeAnalyzer.py alice.pdf bob.pdf --jd-file job.txt
+
+# No arguments: all PDFs in the current directory, job description prompted
+python ResumeAnalyzer.py
+```
+
+Each resume is parsed by Gemini, stored in MongoDB, scored out of 100 and a
+leaderboard is printed at the end.
 
 ### 3. Basic Usage
 
@@ -92,6 +109,13 @@ resumes = [
 result = db.bulk_insert_resumes(resumes)
 ```
 
+### Top Ranked Resumes
+
+```python
+for r in db.get_top_resumes(limit=5):
+    print(r['name'], r['total_score'])
+```
+
 ### Count Resumes
 
 ```python
@@ -153,13 +177,7 @@ finally:
 ### 2. Context Manager (Recommended)
 
 ```python
-class ResumeDatabaseContext(ResumeDatabase):
-    def __enter__(self):
-        return self
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.close_connection()
-
-with ResumeDatabaseContext() as db:
+with ResumeDatabase() as db:
     resume = db.get_resume('resume_001')
     # Connection closes automatically
 ```
@@ -185,8 +203,11 @@ for resume in resumes:
 Run the test suite:
 
 ```bash
-python test_db.py
+pytest
 ```
+
+Tests use an isolated `HireWise_test` database and a fake LLM, so they need a
+running MongoDB but no Gemini API key.
 
 ## 📚 Full Documentation
 

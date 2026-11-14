@@ -206,6 +206,7 @@ def example_ranking_operations():
 def example_error_handling():
     """Example of proper error handling"""
     
+    db = None
     try:
         db = ResumeDatabase()
         
@@ -223,7 +224,8 @@ def example_error_handling():
     except PyMongoError as e:
         print(f"✗ Database error: {e}")
     finally:
-        db.close_connection()
+        if db is not None:
+            db.close_connection()
 
 
 # ============================================================================
@@ -256,20 +258,15 @@ def example_legacy_api():
 # CONTEXT MANAGER (Best Practice)
 # ============================================================================
 
-class ResumeDatabaseContext(ResumeDatabase):
-    """Context manager version for automatic connection cleanup"""
-    
-    def __enter__(self):
-        return self
-    
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.close_connection()
+# ResumeDatabase is itself a context manager; this alias is kept for
+# backward compatibility with code that imported it from here.
+ResumeDatabaseContext = ResumeDatabase
 
 
 def example_context_manager():
     """Example using context manager for automatic cleanup"""
     
-    with ResumeDatabaseContext() as db:
+    with ResumeDatabase() as db:
         # All operations here
         resume = db.get_resume('resume_001')
         print(f"✓ Retrieved: {resume}")
